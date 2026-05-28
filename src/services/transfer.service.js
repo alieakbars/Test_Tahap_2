@@ -4,6 +4,13 @@ const User        = require('../models/user.model');
 const Transaction = require('../models/transaction.model');
 
 async function executeTransfer(senderUserId, targetUserId, amount, remarks, transferId) {
+
+  const existing = await Transaction.findOne({ transaction_id: transferId });
+  if (existing && existing.status === 'SUCCESS') {
+    console.log(`Transfer Already processed: ${transferId}, skipping.`);
+    return existing;
+  }
+
   const session = await mongoose.startSession();
   session.startTransaction();
 
@@ -38,9 +45,21 @@ async function executeTransfer(senderUserId, targetUserId, amount, remarks, tran
 
     const sharedId = transferId || uuidv4();
 
-    const [senderTx] = await Transaction.create(
-      [
-        {
+    let finalSenderTx = await Transaction.findOneAndUpdate(
+      { transaction_id: sharedId },
+      {
+        $set: {
+          status: 'SUCCESS',
+          balance_before: senderBefore,
+          balance_after: senderAfter,
+        },
+      },
+      { session, new: true }
+    );
+
+    if (!finalSenderTx) {
+      const [created] = await Transaction.create(
+        [{
           transaction_id: sharedId,
           user_id: senderUserId,
           transaction_type: 'DEBIT',
@@ -51,14 +70,20 @@ async function executeTransfer(senderUserId, targetUserId, amount, remarks, tran
           balance_before: senderBefore,
           balance_after: senderAfter,
           target_user_id: targetUserId,
-        },
-      ],
-      { session }
-    );
+        }],
+        { session }
+      );
+      finalSenderTx = created;
+    }
 
-    await Transaction.create(
-      [
-        {
+    const existingCredit = await Transaction.findOne({
+      related_transaction_id: sharedId,
+      type: 'TRANSFER_CREDIT',
+    }).session(session);
+
+    if (!existingCredit) {
+      await Transaction.create(
+        [{
           user_id: targetUserId,
           transaction_type: 'CREDIT',
           type: 'TRANSFER_CREDIT',
@@ -69,13 +94,13 @@ async function executeTransfer(senderUserId, targetUserId, amount, remarks, tran
           balance_after: receiverAfter,
           related_transaction_id: sharedId,
           target_user_id: senderUserId,
-        },
-      ],
-      { session }
-    );
+        }],
+        { session }
+      );
+    }
 
     await session.commitTransaction();
-    return senderTx;
+    return finalSenderTx;
   } catch (err) {
     await session.abortTransaction();
     throw err;
@@ -117,13 +142,7 @@ async function initiateTransfer(sender, targetUserId, amount, remarks = '') {
     });
 
     await transferQueue.add(
-      {
-        senderUserId: sender.user_id,
-        targetUserId,
-        amount,
-        remarks,
-        transferId,
-      },
+      { senderUserId: sender.user_id, targetUserId, amount, remarks, transferId },
       {
         attempts: 3,
         backoff: { type: 'exponential', delay: 2000 },
